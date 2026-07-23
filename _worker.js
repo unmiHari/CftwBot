@@ -13,10 +13,14 @@
  *
  * 部署后：
  *   1. BotFather -> /setinline 开启 Inline Mode
- *   2. BotFather -> /setprivacy -> Disable（用于从普通群消息积累成员池）
- *   3. 将机器人加入群；建议设为管理员，以接收 chat_member 更新
- *   4. 请求 /setup，并携带 Authorization: Bearer <ADMIN_SECRET>
- *   5. 群内发送 /bind，点击“绑定此群”，然后使用 @机器人用户名
+ *   2. 将机器人加入群组
+ *   3. 请求 /setup，并携带 Authorization: Bearer <ADMIN_SECRET>
+ *   4. 在群里直接输入 @机器人用户名，选择“每日群友”或“纯文本”
+ *
+ * 说明：
+ *   - 不需要 /bind，机器人不会在群里发送绑定提示。
+ *   - 为了积累更完整的成员池，建议 /setprivacy -> Disable，或将机器人设为管理员。
+ *   - 即使 Privacy Mode 开启，机器人仍能识别通过自身 Inline Mode 发送的消息。
  */
 
 const API_BASE = "https://api.telegram.org";
@@ -51,7 +55,7 @@ export default {
           ok: true,
           service: "Telegram Inline 每日群友 Bot",
           endpoints: ["POST /webhook", "GET /setup", "GET /webhook-info", "GET /delete-webhook"],
-          usage: "在群内发送 /bind 完成绑定，然后输入 @机器人用户名",
+          usage: "将机器人加入群后，直接输入 @机器人用户名；无需 /bind",
         });
       }
 
@@ -87,13 +91,18 @@ export default {
         const claimed = await claimUpdate(env.DATABASE, update.update_id);
         if (!claimed) return text("OK");
 
-        // Inline 查询和按钮回调需要尽快响应，直接等待处理完成。
-        if (update.inline_query || update.callback_query) {
+        // Inline 查询、按钮回调，以及通过本 Bot 发送的内联消息需要立即处理。
+        // 后者会把一次性 context_id 与真实群 chat_id 静默关联，取代 /bind。
+        const inlineContextMessage =
+          extractInlineContext(update.message) ||
+          extractInlineContext(update.edited_message);
+
+        if (update.inline_query || update.callback_query || inlineContextMessage) {
           await handleUpdate(update, env);
           return text("OK");
         }
 
-        // 群消息和成员更新只用于积累成员池，可异步完成。
+        // 其他群消息和成员更新仅用于静默积累成员池，可异步完成。
         ctx.waitUntil(
           handleUpdate(update, env).catch((error) => {
             console.error("Background update failed:", error);
@@ -150,6 +159,16 @@ async function ensureSchema(db) {
       )
     `),
     db.prepare(`
+      CREATE TABLE IF NOT EXISTS inline_contexts (
+        context_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        message_id INTEGER,
+        initiator_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `),
+    db.prepare(`
       CREATE TABLE IF NOT EXISTS inline_draws (
         draw_id TEXT PRIMARY KEY,
         inline_message_id TEXT,
@@ -177,6 +196,10 @@ async function ensureSchema(db) {
     db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_group_users_draw
       ON group_users(chat_id, active, is_bot)
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_inline_contexts_created
+      ON inline_contexts(created_at)
     `),
     db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_inline_draws_created
@@ -222,8 +245,9 @@ async function handleSetup(request, env) {
     set_webhook: result,
     next: [
       "BotFather 使用 /setinline 开启 Inline Mode",
-      "建议 /setprivacy -> Disable",
-      "将机器人加入群并发送 /bind",
+      "将机器人加入目标群组",
+      "直接输入 @机器人用户名，无需 /bind",
+      "建议 /setprivacy -> Disable，以积累更完整的成员池",
     ],
   });
 }
@@ -329,11 +353,6 @@ function makeInlineResult({ id, title, description, mode, initiatorId, nonce }) 
 async function handleCallbackQuery(callback, env) {
   const data = callback.data || "";
 
-  if (data === "bind_group") {
-    await handleBindCallback(callback, env);
-    return;
-  }
-
   if (data.startsWith("draw|")) {
     await handleDrawCallback(callback, env);
     return;
@@ -345,45 +364,6 @@ async function handleCallbackQuery(callback, env) {
   }
 
   await answerCallback(callback.id, env, "无效操作", true);
-}
-
-async function handleBindCallback(callback, env) {
-  const message = callback.message;
-  const chat = message?.chat;
-
-  if (!chat || !isGroupChat(chat)) {
-    await answerCallback(callback.id, env, "请在群组中绑定", true);
-    return;
-  }
-
-  const chatId = String(chat.id);
-  await upsertGroup(env.DATABASE, chat, callback.chat_instance, true);
-  await upsertUser(env.DATABASE, chatId, callback.from, true);
-
-  let importedAdmins = 0;
-  try {
-    const admins = await telegram(env, "getChatAdministrators", { chat_id: chat.id });
-    for (const member of admins || []) {
-      if (member.user) {
-        await upsertUser(env.DATABASE, chatId, member.user, member.status !== "left" && member.status !== "kicked");
-        importedAdmins += 1;
-      }
-    }
-  } catch (error) {
-    console.warn("Import administrators failed:", error);
-  }
-
-  await answerCallback(callback.id, env, "绑定成功");
-
-  const count = await getGroupUserCount(env.DATABASE, chatId);
-  await editCallbackText(
-    callback,
-    env,
-    `✅ <b>本群绑定成功</b>\n\n已记录 ${count} 位成员（其中导入 ${importedAdmins} 位管理员）。\n机器人会从后续群消息和成员变更中继续积累成员。`,
-    {
-      inline_keyboard: [[{ text: "开始抽取", switch_inline_query_current_chat: "" }]],
-    },
-  );
 }
 
 async function handleDrawCallback(callback, env) {
@@ -405,22 +385,20 @@ async function handleDrawCallback(callback, env) {
   await answerCallback(callback.id, env, "正在抽取……");
 
   try {
-    if (!callback.inline_message_id || !callback.chat_instance) {
+    if (!callback.inline_message_id) {
       await showDrawFailure(callback, env);
       return;
     }
 
-    const group = await env.DATABASE
-      .prepare("SELECT * FROM groups WHERE chat_instance = ?1 AND active = 1 LIMIT 1")
-      .bind(callback.chat_instance)
-      .first();
+    const nonce = parts[3];
+    const context = await waitForInlineContext(env.DATABASE, nonce);
 
-    if (!group) {
+    if (!context) {
       await showDrawFailure(callback, env);
       return;
     }
 
-    await upsertUser(env.DATABASE, String(group.chat_id), callback.from, true);
+    await upsertUser(env.DATABASE, String(context.chat_id), callback.from, true);
 
     const selected = await env.DATABASE
       .prepare(`
@@ -430,7 +408,7 @@ async function handleDrawCallback(callback, env) {
         ORDER BY RANDOM()
         LIMIT 1
       `)
-      .bind(String(group.chat_id))
+      .bind(String(context.chat_id))
       .first();
 
     if (!selected) {
@@ -453,8 +431,8 @@ async function handleDrawCallback(callback, env) {
       .bind(
         drawId,
         callback.inline_message_id,
-        String(group.chat_id),
-        callback.chat_instance,
+        String(context.chat_id),
+        callback.chat_instance || "",
         initiatorId,
         initiatorName,
         String(selected.user_id),
@@ -505,6 +483,24 @@ async function handleDrawCallback(callback, env) {
     console.error("Draw failed:", error);
     await showDrawFailure(callback, env);
   }
+}
+
+async function waitForInlineContext(db, contextId) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const context = await db
+      .prepare(`
+        SELECT context_id, chat_id, message_id, initiator_id, mode, created_at
+        FROM inline_contexts
+        WHERE context_id = ?1
+        LIMIT 1
+      `)
+      .bind(contextId)
+      .first();
+
+    if (context) return context;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return null;
 }
 
 async function handleWifeCallback(callback, env) {
@@ -598,25 +594,32 @@ async function handleMessage(message, env) {
       await setUserActive(env.DATABASE, chatId, String(message.left_chat_member.id), false);
     }
 
-    const command = parseCommand(message.text || "");
-    if (command === "bind") {
-      await telegram(env, "sendMessage", {
-        chat_id: chat.id,
-        text: "点击下面的按钮绑定本群。绑定后，内联消息的按钮才能识别当前群组。",
-        reply_markup: {
-          inline_keyboard: [[{ text: "绑定此群", callback_data: "bind_group" }]],
-        },
-      });
-      return;
+    const inlineContext = extractInlineContext(message);
+    if (inlineContext) {
+      await env.DATABASE
+        .prepare(`
+          INSERT INTO inline_contexts (
+            context_id, chat_id, message_id, initiator_id, mode, created_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          ON CONFLICT(context_id) DO UPDATE SET
+            chat_id = excluded.chat_id,
+            message_id = excluded.message_id,
+            initiator_id = excluded.initiator_id,
+            mode = excluded.mode,
+            created_at = excluded.created_at
+        `)
+        .bind(
+          inlineContext.contextId,
+          chatId,
+          message.message_id || null,
+          inlineContext.initiatorId,
+          inlineContext.mode,
+          Date.now(),
+        )
+        .run();
     }
 
-    if (command === "members") {
-      const count = await getGroupUserCount(env.DATABASE, chatId);
-      await telegram(env, "sendMessage", {
-        chat_id: chat.id,
-        text: `当前成员池已记录 ${count} 位非机器人成员。`,
-      });
-    }
+    // 群消息只用于静默维护成员池和内联上下文，不发送任何机器人回复。
     return;
   }
 
@@ -633,14 +636,39 @@ async function handleMessage(message, env) {
         "",
         "使用步骤：",
         "1. 将机器人加入群组",
-        "2. 在群内发送 /bind 并点击绑定",
-        "3. 输入 @机器人用户名，选择“每日群友”或“纯文本”",
+        "2. 直接输入 @机器人用户名",
+        "3. 选择“每日群友”或“纯文本”并发送",
+        "4. 点击消息中的“点击抽取”",
         "",
+        "不需要 /bind，群内不会出现机器人绑定回复。",
         "为了积累更完整的成员池，请关闭 Bot Privacy Mode，或将机器人设为管理员。",
       ].join("\n"),
       reply_markup: inlineButton,
     });
   }
+}
+
+function extractInlineContext(message) {
+  const rows = message?.reply_markup?.inline_keyboard;
+  if (!Array.isArray(rows)) return null;
+
+  for (const row of rows) {
+    for (const button of row || []) {
+      const data = button?.callback_data;
+      if (typeof data !== "string" || !data.startsWith("draw|")) continue;
+
+      const parts = data.split("|");
+      if (parts.length !== 4) continue;
+
+      const [, mode, initiatorId, contextId] = parts;
+      if (!["p", "t"].includes(mode)) continue;
+      if (!/^\d+$/.test(String(initiatorId))) continue;
+      if (!/^[A-Za-z0-9_-]{6,32}$/.test(String(contextId))) continue;
+
+      return { mode, initiatorId: String(initiatorId), contextId };
+    }
+  }
+  return null;
 }
 
 async function handleChatMemberUpdate(update, env) {
@@ -662,9 +690,29 @@ async function handleMyChatMemberUpdate(update, env) {
   const chat = update.chat;
   if (!isGroupChat(chat)) return;
 
+  const chatId = String(chat.id);
   const status = update.new_chat_member?.status;
   const active = !["left", "kicked"].includes(status);
   await upsertGroup(env.DATABASE, chat, null, active);
+
+  if (!active) return;
+
+  // 不发送任何群消息；仅在机器人加入/权限变化时静默导入管理员。
+  if (update.from) {
+    await upsertUser(env.DATABASE, chatId, update.from, true);
+  }
+
+  try {
+    const admins = await telegram(env, "getChatAdministrators", { chat_id: chat.id });
+    for (const member of admins || []) {
+      if (member?.user) {
+        const memberActive = !["left", "kicked"].includes(member.status);
+        await upsertUser(env.DATABASE, chatId, member.user, memberActive);
+      }
+    }
+  } catch (error) {
+    console.warn("Silent administrator import failed:", error);
+  }
 }
 
 async function upsertGroup(db, chat, chatInstance, active) {
