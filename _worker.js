@@ -10,6 +10,7 @@
  * 建议变量：
  *   TG_BOT_USERNAME       机器人用户名，不含 @；未配置时会通过 getMe 获取
  *   DOMAIN                自定义域名或 workers.dev 域名，可带或不带 https://
+ *   DAILY_TIMEZONE         每日刷新时区，默认 Asia/Kuala_Lumpur
  *
  * 部署后：
  *   1. BotFather -> /setinline 开启 Inline Mode
@@ -24,6 +25,7 @@
 
 const API_BASE = "https://api.telegram.org";
 const DRAW_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_DAILY_TIMEZONE = "Asia/Kuala_Lumpur";
 const ALLOWED_UPDATES = [
   "message",
   "edited_message",
@@ -183,6 +185,26 @@ async function ensureSchema(db) {
       )
     `),
     db.prepare(`
+      CREATE TABLE IF NOT EXISTS daily_draws (
+        draw_date TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        initiator_id TEXT NOT NULL,
+        initiator_name TEXT NOT NULL,
+        selected_user_id TEXT NOT NULL,
+        selected_name TEXT NOT NULL,
+        selected_username TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (draw_date, chat_id, initiator_id)
+      )
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS app_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `),
+    db.prepare(`
       CREATE TABLE IF NOT EXISTS processed_updates (
         update_id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL
@@ -203,6 +225,10 @@ async function ensureSchema(db) {
     db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_inline_draws_created
       ON inline_draws(created_at)
+    `),
+    db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_daily_draws_date
+      ON daily_draws(draw_date)
     `),
   ]);
 
@@ -297,6 +323,15 @@ async function handleUpdate(update, env) {
 }
 
 async function handleInlineQuery(query, env) {
+  const today = currentDateKey(env);
+  await ensureDailyReset(env.DATABASE, today);
+
+  const queryText = String(query.query || "").trim();
+  if (queryText.startsWith("wife:")) {
+    await handleWifeInlineQuery(query, env, queryText.slice("wife:".length));
+    return;
+  }
+
   const initiatorId = String(query.from.id);
   const nonce = randomId(10);
 
@@ -357,11 +392,6 @@ async function handleCallbackQuery(callback, env) {
     return;
   }
 
-  if (data.startsWith("wife|")) {
-    await handleWifeCallback(callback, env);
-    return;
-  }
-
   await answerCallback(callback.id, env, "无效操作", true);
 }
 
@@ -380,7 +410,6 @@ async function handleDrawCallback(callback, env) {
     return;
   }
 
-  // 先结束客户端按钮加载动画；实际结果随后通过编辑消息展示。
   await answerCallback(callback.id, env, "正在抽取……");
 
   try {
@@ -397,26 +426,28 @@ async function handleDrawCallback(callback, env) {
       return;
     }
 
-    await upsertUser(env.DATABASE, String(context.chat_id), callback.from, true);
+    const chatId = String(context.chat_id);
+    const today = currentDateKey(env);
 
-    const selected = await env.DATABASE
-      .prepare(`
-        SELECT user_id, first_name, last_name, username
-        FROM group_users
-        WHERE chat_id = ?1 AND active = 1 AND is_bot = 0
-        ORDER BY RANDOM()
-        LIMIT 1
-      `)
-      .bind(String(context.chat_id))
-      .first();
+    await ensureDailyReset(env.DATABASE, today);
+    await upsertUser(env.DATABASE, chatId, callback.from, true);
 
-    if (!selected) {
+    const dailyDraw = await getOrCreateDailyDraw(
+      env.DATABASE,
+      today,
+      chatId,
+      initiatorId,
+      callback.from,
+    );
+
+    if (!dailyDraw) {
       await showDrawFailure(callback, env);
       return;
     }
 
-    const initiatorName = displayName(callback.from);
-    const selectedName = displayName(selected);
+    const initiatorName = dailyDraw.initiator_name || displayName(callback.from);
+    const selectedUserId = String(dailyDraw.selected_user_id);
+    const selectedName = dailyDraw.selected_name || "群友";
     const drawId = randomId(20);
 
     await env.DATABASE
@@ -430,13 +461,13 @@ async function handleDrawCallback(callback, env) {
       .bind(
         drawId,
         callback.inline_message_id,
-        String(context.chat_id),
+        chatId,
         callback.chat_instance || "",
         initiatorId,
         initiatorName,
-        String(selected.user_id),
+        selectedUserId,
         selectedName,
-        selected.username || null,
+        dailyDraw.selected_username || null,
         mode === "p" ? "photo" : "text",
         Date.now(),
       )
@@ -444,15 +475,25 @@ async function handleDrawCallback(callback, env) {
 
     const resultText = [
       `哇，${mention(initiatorId, initiatorName)}！`,
-      `你的今日女友是 ${mention(String(selected.user_id), selectedName)} ~`,
+      `你的今日女友是 ${mention(selectedUserId, selectedName)} ~`,
     ].join("\n");
 
+    // Telegram 不允许 callback 按钮直接替用户发送新消息。
+    // 此按钮会在当前聊天打开 Inline Mode；用户再点唯一结果后，
+    // Telegram 才会以发起用户身份发送新的 via @bot 消息。
     const keyboard = {
-      inline_keyboard: [[{ text: "老婆~", callback_data: `wife|${drawId}` }]],
+      inline_keyboard: [
+        [
+          {
+            text: "老婆~",
+            switch_inline_query_current_chat: `wife:${drawId}`,
+          },
+        ],
+      ],
     };
 
     if (mode === "p") {
-      const photoFileId = await getProfilePhotoFileId(selected.user_id, env);
+      const photoFileId = await getProfilePhotoFileId(selectedUserId, env);
       if (photoFileId) {
         try {
           await telegram(env, "editMessageMedia", {
@@ -502,10 +543,9 @@ async function waitForInlineContext(db, contextId) {
   return null;
 }
 
-async function handleWifeCallback(callback, env) {
-  const [, drawId] = (callback.data || "").split("|");
-  if (!drawId) {
-    await answerCallback(callback.id, env, "操作参数无效", true);
+async function handleWifeInlineQuery(query, env, drawId) {
+  if (!/^[A-Za-z0-9_-]{6,32}$/.test(String(drawId || ""))) {
+    await answerEmptyInlineQuery(query.id, env);
     return;
   }
 
@@ -514,56 +554,159 @@ async function handleWifeCallback(callback, env) {
     .bind(drawId)
     .first();
 
-  if (!draw || Date.now() - Number(draw.created_at) > DRAW_TTL_MS) {
-    await answerCallback(callback.id, env, "这个抽取结果已经失效了~", true);
+  const today = currentDateKey(env);
+  const isCurrentDay =
+    draw && dateKeyForTimestamp(Number(draw.created_at), env) === today;
+
+  if (
+    !draw ||
+    !isCurrentDay ||
+    Date.now() - Number(draw.created_at) > DRAW_TTL_MS ||
+    String(query.from.id) !== String(draw.initiator_id)
+  ) {
+    await answerEmptyInlineQuery(query.id, env);
     return;
   }
 
-  if (String(callback.from.id) !== String(draw.initiator_id)) {
-    await answerCallback(callback.id, env, "这又不是你的老婆~", true);
-    return;
-  }
-
-  const inlineMessageId = callback.inline_message_id || draw.inline_message_id;
-  if (!inlineMessageId) {
-    await answerCallback(callback.id, env, "无法找到原内联消息", true);
-    return;
-  }
-
-  // 不使用 sendMessage。直接编辑发起用户发送的原内联消息，
-  // 因此群里不会出现一条由机器人账号额外发送的新消息。
   const wifeText = `${mention(String(draw.selected_user_id), draw.selected_name)} 哇，老婆~`;
-  const emptyKeyboard = { inline_keyboard: [] };
+
+  await telegram(env, "answerInlineQuery", {
+    inline_query_id: query.id,
+    results: [
+      {
+        type: "article",
+        id: `wife_${draw.draw_id}`,
+        title: `${draw.selected_name} 哇，老婆~`,
+        description: "点击发送新的 via @bot 消息",
+        input_message_content: {
+          message_text: wifeText,
+          parse_mode: "HTML",
+        },
+      },
+    ],
+    cache_time: 0,
+    is_personal: true,
+  });
+}
+
+async function answerEmptyInlineQuery(inlineQueryId, env) {
+  await telegram(env, "answerInlineQuery", {
+    inline_query_id: inlineQueryId,
+    results: [],
+    cache_time: 0,
+    is_personal: true,
+  });
+}
+
+async function ensureDailyReset(db, today) {
+  const state = await db
+    .prepare("SELECT value FROM app_meta WHERE key = 'daily_draw_date' LIMIT 1")
+    .first();
+
+  if (state?.value === today) return;
+
+  // 并发时只删除非今天的数据，因此不会误删另一个请求刚写入的今日记录。
+  await db.batch([
+    db.prepare("DELETE FROM daily_draws WHERE draw_date <> ?1").bind(today),
+    db
+      .prepare(`
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES ('daily_draw_date', ?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at
+      `)
+      .bind(today, Date.now()),
+  ]);
+}
+
+async function getOrCreateDailyDraw(db, drawDate, chatId, initiatorId, initiator) {
+  let saved = await db
+    .prepare(`
+      SELECT *
+      FROM daily_draws
+      WHERE draw_date = ?1 AND chat_id = ?2 AND initiator_id = ?3
+      LIMIT 1
+    `)
+    .bind(drawDate, chatId, initiatorId)
+    .first();
+
+  if (saved) return saved;
+
+  const selected = await db
+    .prepare(`
+      SELECT user_id, first_name, last_name, username
+      FROM group_users
+      WHERE chat_id = ?1 AND active = 1 AND is_bot = 0
+      ORDER BY RANDOM()
+      LIMIT 1
+    `)
+    .bind(chatId)
+    .first();
+
+  if (!selected) return null;
+
+  const initiatorName = displayName(initiator);
+  const selectedName = displayName(selected);
+
+  await db
+    .prepare(`
+      INSERT OR IGNORE INTO daily_draws (
+        draw_date, chat_id, initiator_id, initiator_name,
+        selected_user_id, selected_name, selected_username, created_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    `)
+    .bind(
+      drawDate,
+      chatId,
+      initiatorId,
+      initiatorName,
+      String(selected.user_id),
+      selectedName,
+      selected.username || null,
+      Date.now(),
+    )
+    .run();
+
+  // 并发点击时，以数据库中首次成功写入的结果为准。
+  saved = await db
+    .prepare(`
+      SELECT *
+      FROM daily_draws
+      WHERE draw_date = ?1 AND chat_id = ?2 AND initiator_id = ?3
+      LIMIT 1
+    `)
+    .bind(drawDate, chatId, initiatorId)
+    .first();
+
+  return saved || null;
+}
+
+function currentDateKey(env) {
+  return dateKeyForTimestamp(Date.now(), env);
+}
+
+function dateKeyForTimestamp(timestamp, env) {
+  const timeZone = String(env.DAILY_TIMEZONE || DEFAULT_DAILY_TIMEZONE).trim();
 
   try {
-    if (draw.mode === "photo") {
-      try {
-        // 图片抽取成功时，原消息是媒体消息，只能编辑 caption。
-        await telegram(env, "editMessageCaption", {
-          inline_message_id: inlineMessageId,
-          caption: wifeText,
-          parse_mode: "HTML",
-          reply_markup: emptyKeyboard,
-        });
-        await answerCallback(callback.id, env, "你喊了老婆~");
-        return;
-      } catch (captionError) {
-        // 图片获取失败时，photo 模式此前会降级成纯文本，继续尝试编辑正文。
-        console.warn("Edit wife caption failed, trying text:", captionError);
-      }
-    }
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(timestamp));
 
-    await telegram(env, "editMessageText", {
-      inline_message_id: inlineMessageId,
-      text: wifeText,
-      parse_mode: "HTML",
-      reply_markup: emptyKeyboard,
-    });
+    const values = Object.fromEntries(
+      parts
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value]),
+    );
 
-    await answerCallback(callback.id, env, "你喊了老婆~");
+    return `${values.year}-${values.month}-${values.day}`;
   } catch (error) {
-    console.error("Edit initiator inline message failed:", error);
-    await answerCallback(callback.id, env, "喊老婆失败，原消息可能已无法编辑", true);
+    console.warn(`Invalid DAILY_TIMEZONE "${timeZone}", falling back to UTC:`, error);
+    return new Date(timestamp).toISOString().slice(0, 10);
   }
 }
 
