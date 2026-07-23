@@ -568,7 +568,15 @@ async function handleWifeInlineQuery(query, env, drawId) {
     return;
   }
 
-  const wifeText = `${mention(String(draw.selected_user_id), draw.selected_name)} 哇，老婆~`;
+  // “喊老婆”消息优先使用 Telegram 用户名，确保群内可以直接 @ 到对方。
+  // selected_username 在 D1 中保存时通常不含 @，这里统一清理后再补上。
+  const selectedUsername = String(draw.selected_username || "")
+    .trim()
+    .replace(/^@+/, "");
+  const wifeTarget = selectedUsername
+    ? `@${selectedUsername}`
+    : String(draw.selected_name || "群友");
+  const wifeText = `${wifeTarget} 哇，老婆~`;
 
   await telegram(env, "answerInlineQuery", {
     inline_query_id: query.id,
@@ -576,11 +584,12 @@ async function handleWifeInlineQuery(query, env, drawId) {
       {
         type: "article",
         id: `wife_${draw.draw_id}`,
-        title: `${draw.selected_name} 哇，老婆~`,
-        description: "点击发送新的 via @bot 消息",
+        title: wifeText,
+        description: selectedUsername
+          ? "点击发送，可直接艾特被抽取用户"
+          : "该用户没有用户名，将使用昵称发送",
         input_message_content: {
           message_text: wifeText,
-          parse_mode: "HTML",
         },
       },
     ],
