@@ -14,11 +14,10 @@
  * 部署后：
  *   1. BotFather -> /setinline 开启 Inline Mode
  *   2. 将机器人加入群组
- *   3. 请求 /setup，并携带 Authorization: Bearer <ADMIN_SECRET>
+ *   3. 进入机器人后台网址初始化机器人 https://你的域名/setup?key=你的ADMIN_SECRET
  *   4. 在群里直接输入 @机器人用户名，选择“每日群友”或“纯文本”
  *
  * 说明：
- *   - 不需要 /bind，机器人不会在群里发送绑定提示。
  *   - 为了积累更完整的成员池，建议 /setprivacy -> Disable，或将机器人设为管理员。
  *   - 即使 Privacy Mode 开启，机器人仍能识别通过自身 Inline Mode 发送的消息。
  */
@@ -55,7 +54,7 @@ export default {
           ok: true,
           service: "Telegram Inline 每日群友 Bot",
           endpoints: ["POST /webhook", "GET /setup", "GET /webhook-info", "GET /delete-webhook"],
-          usage: "将机器人加入群后，直接输入 @机器人用户名；无需 /bind",
+          usage: "将机器人加入群后，直接输入 @机器人用户名 选择选项",
         });
       }
 
@@ -335,7 +334,7 @@ function makeInlineResult({ id, title, description, mode, initiatorId, nonce }) 
     title,
     description,
     input_message_content: {
-      message_text: "正在抽取……",
+      message_text: "无法查看你的聊天上下文，请点击下方按钮继续",
     },
     reply_markup: {
       inline_keyboard: [
@@ -521,7 +520,7 @@ async function handleWifeCallback(callback, env) {
   }
 
   if (String(callback.from.id) !== String(draw.initiator_id)) {
-    await answerCallback(callback.id, env, "只有发起人可以喊老婆~", true);
+    await answerCallback(callback.id, env, "这又不是你的老婆~", true);
     return;
   }
 
@@ -542,7 +541,7 @@ async function handleWifeCallback(callback, env) {
 async function showDrawFailure(callback, env) {
   const username = await getBotUsername(env).catch(() => "");
   const keyboard = username
-    ? { inline_keyboard: [[{ text: "进入机器人主页", url: `https://t.me/${username}?start=draw_error` }]] }
+    ? { inline_keyboard: [[{ text: "进入主页", url: `https://t.me/${username}?start=draw_error` }]] }
     : undefined;
 
   const payload = {
@@ -632,7 +631,7 @@ async function handleMessage(message, env) {
     await telegram(env, "sendMessage", {
       chat_id: chat.id,
       text: [
-        "这是一个群组内联抽取机器人。",
+        "这是一个群员老婆抽取机器人。",
         "",
         "使用步骤：",
         "1. 将机器人加入群组",
@@ -640,8 +639,7 @@ async function handleMessage(message, env) {
         "3. 选择“每日群友”或“纯文本”并发送",
         "4. 点击消息中的“点击抽取”",
         "",
-        "不需要 /bind，群内不会出现机器人绑定回复。",
-        "为了积累更完整的成员池，请关闭 Bot Privacy Mode，或将机器人设为管理员。",
+        "为了积累更完整的成员池，将机器人设为管理员。(可选)",
       ].join("\n"),
       reply_markup: inlineButton,
     });
