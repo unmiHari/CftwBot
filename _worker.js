@@ -524,17 +524,46 @@ async function handleWifeCallback(callback, env) {
     return;
   }
 
+  const inlineMessageId = callback.inline_message_id || draw.inline_message_id;
+  if (!inlineMessageId) {
+    await answerCallback(callback.id, env, "无法找到原内联消息", true);
+    return;
+  }
+
+  // 不使用 sendMessage。直接编辑发起用户发送的原内联消息，
+  // 因此群里不会出现一条由机器人账号额外发送的新消息。
+  const wifeText = `${mention(String(draw.selected_user_id), draw.selected_name)} 哇，老婆~`;
+  const emptyKeyboard = { inline_keyboard: [] };
+
   try {
-    const wifeText = `${mention(String(draw.selected_user_id), draw.selected_name)} 哇，老婆~`;
-    await telegram(env, "sendMessage", {
-      chat_id: draw.chat_id,
+    if (draw.mode === "photo") {
+      try {
+        // 图片抽取成功时，原消息是媒体消息，只能编辑 caption。
+        await telegram(env, "editMessageCaption", {
+          inline_message_id: inlineMessageId,
+          caption: wifeText,
+          parse_mode: "HTML",
+          reply_markup: emptyKeyboard,
+        });
+        await answerCallback(callback.id, env, "你喊了老婆~");
+        return;
+      } catch (captionError) {
+        // 图片获取失败时，photo 模式此前会降级成纯文本，继续尝试编辑正文。
+        console.warn("Edit wife caption failed, trying text:", captionError);
+      }
+    }
+
+    await telegram(env, "editMessageText", {
+      inline_message_id: inlineMessageId,
       text: wifeText,
       parse_mode: "HTML",
+      reply_markup: emptyKeyboard,
     });
-    await answerCallback(callback.id, env, "已经帮你喊老婆啦~");
+
+    await answerCallback(callback.id, env, "你喊了老婆~");
   } catch (error) {
-    console.error("Send wife message failed:", error);
-    await answerCallback(callback.id, env, "发送失败，请确认机器人仍在群内", true);
+    console.error("Edit initiator inline message failed:", error);
+    await answerCallback(callback.id, env, "喊老婆失败，原消息可能已无法编辑", true);
   }
 }
 
